@@ -118,8 +118,8 @@ extern const float segmentAlphaY = ang_res_y / 180.0 * M_PI;
 extern const int edgeFeatureNum = 2;
 extern const int surfFeatureNum = 4;
 extern const int sectionsTotal = 6;
-extern const float edgeThreshold = 0.1;
-extern const float surfThreshold = 0.1;
+extern const float edgeThreshold = 0.1;  // 角点的曲率阈值，即角点的曲率必须大于该值
+extern const float surfThreshold = 0.1;  // 面点的曲率阈值，即面点的曲率必须小于该值
 extern const float nearestFeatureSearchSqDist = 25;
 
 

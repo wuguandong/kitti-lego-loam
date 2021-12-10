@@ -53,34 +53,48 @@ private:
     pcl::PointCloud<PointType>::Ptr segmentedCloud;
     pcl::PointCloud<PointType>::Ptr outlierCloud;
 
-    pcl::PointCloud<PointType>::Ptr cornerPointsSharp;
-    pcl::PointCloud<PointType>::Ptr cornerPointsLessSharp;
-    pcl::PointCloud<PointType>::Ptr surfPointsFlat;
-    pcl::PointCloud<PointType>::Ptr surfPointsLessFlat;
+    pcl::PointCloud<PointType>::Ptr cornerPointsSharp;  // 优质角点，数量：2 * TODO
+    pcl::PointCloud<PointType>::Ptr cornerPointsLessSharp;  // 次优角点，数量：20           注：优质角点 是 次优角点 的子集
+    pcl::PointCloud<PointType>::Ptr surfPointsFlat;  // 优质面点，数量：4
+    pcl::PointCloud<PointType>::Ptr surfPointsLessFlat;  // 次优面点，数量：海量
 
+    // 这两个变量是 extractFeature() 方法专用的变量，其实可以用局部变量的
     pcl::PointCloud<PointType>::Ptr surfPointsLessFlatScan;
     pcl::PointCloud<PointType>::Ptr surfPointsLessFlatScanDS;
 
+    // 体素滤波器，用来对 次优面点 下采样，体素边长：0.2m
     pcl::VoxelGrid<PointType> downSizeFilter;
 
+    // 保存激光点云的时间戳（单位：s），这两个变量时间相同
     double timeScanCur;
     double timeNewSegmentedCloud;
+    // 最新 分割点云信息消息 的时间戳
     double timeNewSegmentedCloudInfo;
+    // 最新 离群点云消息 的时间戳
     double timeNewOutlierCloud;
 
+    // 用来标记是否收到了新的分割点云消息
     bool newSegmentedCloud;
+    // 用来标记是否收到了新的分割点云信息消息
     bool newSegmentedCloudInfo;
+    // 用来标记是否收到了新的离群点云消息
     bool newOutlierCloud;
 
+    // 最新收到的 点云分割信息消息
     cloud_msgs::cloud_info segInfo;
+    // 从 /segmented_cloud 话题消息的 heaser 取出
     std_msgs::Header cloudHeader;
 
     int systemInitCount;
     bool systemInited;
 
+    // 每个元素保存的是 {value : 曲率, ind : 下标}
     std::vector<smoothness_t> cloudSmoothness;
+    // 存放所有点的曲率
     float cloudCurvature[N_SCAN*Horizon_SCAN];
+    // 初始值为0，遮挡点会被标记为1，如果一个点被选为特征点则其及左右各5个点都会被标记为1
     int cloudNeighborPicked[N_SCAN*Horizon_SCAN];
+    // 记录每个点是什么特征点，0表示非特征点，2表示优质角点，1表示次优角点, -1表示优质面点  （值为0和-1的点，都被当做次优面点）
     int cloudLabel[N_SCAN*Horizon_SCAN];
 
     int imuPointerFront;
@@ -147,6 +161,7 @@ private:
     float pointSearchCornerInd2[N_SCAN*Horizon_SCAN];
 
     int pointSelSurfInd[N_SCAN*Horizon_SCAN];
+    // 下方三个数组可以当做一个3行n列的二维数组，每一列是能够确定一个平面的三个点，该平面就是用于优质面点优化的平面
     float pointSearchSurfInd1[N_SCAN*Horizon_SCAN];
     float pointSearchSurfInd2[N_SCAN*Horizon_SCAN];
     float pointSearchSurfInd3[N_SCAN*Horizon_SCAN];
@@ -160,12 +175,16 @@ private:
 
     pcl::PointCloud<PointType>::Ptr laserCloudCornerLast;
     pcl::PointCloud<PointType>::Ptr laserCloudSurfLast;
+    // 找到了对应平面的 优质面点
     pcl::PointCloud<PointType>::Ptr laserCloudOri;
+    // 优质面点 对应的 平面方程 的系数
     pcl::PointCloud<PointType>::Ptr coeffSel;
 
     pcl::KdTreeFLANN<PointType>::Ptr kdtreeCornerLast;
     pcl::KdTreeFLANN<PointType>::Ptr kdtreeSurfLast;
 
+    // findCorrespondingSurfFeatures() 方法专用变量
+    // 分别用来存放 KNN 搜索的 下标、距离
     std::vector<int> pointSearchInd;
     std::vector<float> pointSearchSqDis;
 
@@ -235,7 +254,7 @@ public:
         systemInited = false;
 
         imuPointerFront = 0;
-        imuPointerLast = -1;
+        imuPointerLast = -1;  // 将 IMU相关数组 的指针初始化为 -1
         imuPointerLastIteration = 0;
 
         imuRollStart = 0; imuPitchStart = 0; imuYawStart = 0;
@@ -415,8 +434,12 @@ public:
         }
     }
 
+    /*
+    IMU话题消息的处理方法
+    */
     void imuHandler(const sensor_msgs::Imu::ConstPtr& imuIn)
     {
+        // 将 IMU 中 geometry_msgs::Quaternion 类型的 方向，转换为 RPY
         double roll, pitch, yaw;
         tf::Quaternion orientation;
         tf::quaternionMsgToTF(imuIn->orientation, orientation);
@@ -426,6 +449,7 @@ public:
         float accY = imuIn->linear_acceleration.z - cos(roll) * cos(pitch) * 9.81;
         float accZ = imuIn->linear_acceleration.x + sin(pitch) * 9.81;
 
+        // 类似循环队列
         imuPointerLast = (imuPointerLast + 1) % imuQueLength;
 
         imuTime[imuPointerLast] = imuIn->header.stamp.toSec();
@@ -445,36 +469,61 @@ public:
         AccumulateIMUShiftAndRotation();
     }
 
+    /*
+    话题 /segmented_cloud 消息处理方法
+    */
     void laserCloudHandler(const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg){
-
+        // 将 header 保存到成员变量
         cloudHeader = laserCloudMsg->header;
 
+        // 将激光扫描发生时间存入成员变量
         timeScanCur = cloudHeader.stamp.toSec();
-        timeNewSegmentedCloud = timeScanCur;
+        timeNewSegmentedCloud = timeScanCur;  // 疑问：这里怎么又存了一份
 
+        // 将 ROS Message 类型的点云，转换成 PCL 类型的点云，存入 segmentedCloud 成员变量
         segmentedCloud->clear();
         pcl::fromROSMsg(*laserCloudMsg, *segmentedCloud);
 
+        // 标记，收到了新的分割点云
         newSegmentedCloud = true;
     }
 
+    /*
+    话题 /outlier_cloud 消息处理方法
+    */
     void outlierCloudHandler(const sensor_msgs::PointCloud2ConstPtr& msgIn){
-
+        // 将时间戳保存到成员变量
         timeNewOutlierCloud = msgIn->header.stamp.toSec();
 
+        // 将 ROS Message 类型的点云，转换成 PCL 类型的点云，存入 outlierCloud 成员变量
         outlierCloud->clear();
         pcl::fromROSMsg(*msgIn, *outlierCloud);
 
+        // 标记，收到了新的离群点云
         newOutlierCloud = true;
     }
 
+    /*
+    话题 /segmented_cloud_info 消息处理方法
+    */
     void laserCloudInfoHandler(const cloud_msgs::cloud_infoConstPtr& msgIn)
     {
+        // 将时间戳存入成员变量
         timeNewSegmentedCloudInfo = msgIn->header.stamp.toSec();
+
+        // 将话题消息存入成员变量
         segInfo = *msgIn;
+
+        // 标记，收到了新的分割点云信息
         newSegmentedCloudInfo = true;
     }
 
+    /*
+    使用IMU数据校正激光雷达点云数据的畸变
+
+    作用：
+    TODO
+    */
     void adjustDistortion()
     {
         bool halfPassed = false;
@@ -484,10 +533,17 @@ public:
 
         for (int i = 0; i < cloudSize; i++) {
 
+            // 需要注意的是，作者调换了坐标轴
+            // 原始为（假设为Velodyne雷达） y朝前，x朝右，z朝上
+            // 现在变为：
+            // x朝前，y朝上，z朝右 !!!!
             point.x = segmentedCloud->points[i].y;
             point.y = segmentedCloud->points[i].z;
             point.z = segmentedCloud->points[i].x;
 
+            // segInfo 的 startOrientation 和 endOrientation 都是以右侧为0度（顺时针增加）
+
+            // -atan2(x,z) 计算的是以右侧为0度（顺时针增加）的方位角
             float ori = -atan2(point.x, point.z);
             if (!halfPassed) {
                 if (ori < segInfo.startOrientation - M_PI / 2)
@@ -497,7 +553,8 @@ public:
 
                 if (ori - segInfo.startOrientation > M_PI)
                     halfPassed = true;
-            } else {
+            }
+            else {
                 ori += 2 * M_PI;
 
                 if (ori < segInfo.endOrientation - M_PI * 3 / 2)
@@ -509,6 +566,7 @@ public:
             float relTime = (ori - segInfo.startOrientation) / segInfo.orientationDiff;
             point.intensity = int(segmentedCloud->points[i].intensity) + scanPeriod * relTime;
 
+            // 如果没有IMU，imuPointerLast的值为-1，该if不会进入
             if (imuPointerLast >= 0) {
                 float pointTime = relTime * scanPeriod;
                 imuPointerFront = imuPointerLastIteration;
@@ -608,8 +666,20 @@ public:
     void calculateSmoothness()
     {
         int cloudSize = segmentedCloud->points.size();
+
+        // 前5个点 和 最后5个点，不参与遍历
         for (int i = 5; i < cloudSize - 5; i++) {
 
+            // 记当前点左侧的5个点的深度从左到右分别为：l5、l4、l3、l2、l1
+            //   当前点右侧的5个点的深度从左到右分别为：r1、r2、r3、r4、r5
+            //   当前点的深度为：c
+            // diffRange = (l5 - c) + (l4 - c) + (l3 - c) + (l2 - c) + (l1 - c) + (r1 - c) + (r2 - c) + (r3 - c) + (r4 - c) + (r5 - c)
+            // 感性理解：
+            // 以雷达为中心，画一个过当前点的圆弧，因为圆弧曲率很小，我们可以把它当成一个线段，线段可以绕着当前点旋转
+            // 如果左侧5个点和右侧5个点都在该线段上，则 diffRange 为0，表示当前点的曲率为0
+            // 如果10个点都在线段的单侧，则 diffRange 的绝对值会很大，表示当前点的曲率很大
+            // 对于墙角，diffRange的绝对值可能为一个>0的较小值
+            // 对于细电线杆，diffRange的绝对值可能为一个>0的很大的值
             float diffRange = segInfo.segmentedCloudRange[i-5] + segInfo.segmentedCloudRange[i-4]
                             + segInfo.segmentedCloudRange[i-3] + segInfo.segmentedCloudRange[i-2]
                             + segInfo.segmentedCloudRange[i-1] - segInfo.segmentedCloudRange[i] * 10
@@ -617,11 +687,14 @@ public:
                             + segInfo.segmentedCloudRange[i+3] + segInfo.segmentedCloudRange[i+4]
                             + segInfo.segmentedCloudRange[i+5];            
 
+            // 将 diffRange² 作为该点的曲率值，保存至成员变量 cloudCurvature 中
             cloudCurvature[i] = diffRange*diffRange;
 
             cloudNeighborPicked[i] = 0;
-            cloudLabel[i] = 0;
+            cloudLabel[i] = 0;  // cloudLabel用来存放每个点为什么特征点，0表示该点不是特征点
 
+            // 将 {value : 曲率, ind : 下标} 的结构体 保存到成员变量 cloudSmoothness 中，
+            // 这样存放的好处是，接下来对 曲率进行排序，还能找到最大曲率值对应的点的下标
             cloudSmoothness[i].value = cloudCurvature[i];
             cloudSmoothness[i].ind = i;
         }
@@ -631,22 +704,29 @@ public:
     {
         int cloudSize = segmentedCloud->points.size();
 
-        for (int i = 5; i < cloudSize - 6; ++i){
+        // 前5个点、最后6个点，不参与循环
+        for (int i = 5; i < cloudSize - 6; i++){
 
             float depth1 = segInfo.segmentedCloudRange[i];
             float depth2 = segInfo.segmentedCloudRange[i+1];
+            // segInfo 的 segmentedCloudColInd 存放的是当前点在深度图中的列号
             int columnDiff = std::abs(int(segInfo.segmentedCloudColInd[i+1] - segInfo.segmentedCloudColInd[i]));
 
             if (columnDiff < 10){
 
+                // 说明左侧是背景点，右侧是前景点
                 if (depth1 - depth2 > 0.3){
+                    // 当前点及左侧5个背景点标记为屏蔽点，这些点即使曲率高也不提取用作角点
                     cloudNeighborPicked[i - 5] = 1;
                     cloudNeighborPicked[i - 4] = 1;
                     cloudNeighborPicked[i - 3] = 1;
                     cloudNeighborPicked[i - 2] = 1;
                     cloudNeighborPicked[i - 1] = 1;
-                    cloudNeighborPicked[i] = 1;
-                }else if (depth2 - depth1 > 0.3){
+                    cloudNeighborPicked[i] = 1;  // 注意这里
+                }
+                // 说明左侧是前景点，右侧是背景点
+                else if (depth2 - depth1 > 0.3){
+                    // 右侧5个背景点标记为屏蔽点，这些点即使曲率高也不提取用作角点
                     cloudNeighborPicked[i + 1] = 1;
                     cloudNeighborPicked[i + 2] = 1;
                     cloudNeighborPicked[i + 3] = 1;
@@ -656,9 +736,9 @@ public:
                 }
             }
 
+            // 如果一个点，和它左侧点、右侧点的深度之差都比较大，说明这个点很有可能是个噪点，即使该点曲率高也不提取用作角点
             float diff1 = std::abs(float(segInfo.segmentedCloudRange[i-1] - segInfo.segmentedCloudRange[i]));
             float diff2 = std::abs(float(segInfo.segmentedCloudRange[i+1] - segInfo.segmentedCloudRange[i]));
-
             if (diff1 > 0.02 * segInfo.segmentedCloudRange[i] && diff2 > 0.02 * segInfo.segmentedCloudRange[i])
                 cloudNeighborPicked[i] = 1;
         }
@@ -666,15 +746,19 @@ public:
 
     void extractFeatures()
     {
+        // 将存放4类特征点的 点云成员变量 清空
         cornerPointsSharp->clear();
         cornerPointsLessSharp->clear();
         surfPointsFlat->clear();
         surfPointsLessFlat->clear();
 
+        // 对每个环进行遍历
         for (int i = 0; i < N_SCAN; i++) {
 
+            // 这个成员变量用来存放什么？
             surfPointsLessFlatScan->clear();
 
+            // j的取值为[0,5]，j代表什么含义？
             for (int j = 0; j < 6; j++) {
 
                 int sp = (segInfo.startRingIndex[i] * (6 - j)    + segInfo.endRingIndex[i] * j) / 6;
@@ -683,34 +767,58 @@ public:
                 if (sp >= ep)
                     continue;
 
+                // 对这个扇区内的点的曲率，按照从小到大的顺序排序
+                // 排序完成后，cloudSmoothness 下标范围为 [sp,ep] 的元素，其曲率值是递增的
                 std::sort(cloudSmoothness.begin()+sp, cloudSmoothness.begin()+ep, by_value());
 
                 int largestPickedNum = 0;
+                // 从下标ep到下标sp，对cloudSmoothness遍历，即按照曲率从大到小遍历
+                // 显然，这个过程是用来选择角点
                 for (int k = ep; k >= sp; k--) {
-                    int ind = cloudSmoothness[k].ind;
+                    int ind = cloudSmoothness[k].ind;  // 当前点在 segmentedCloud 中的下标
+
+                    // 如果满足以下三个条件：
+                    // ① 该点不为遮挡点。关于遮挡点，在 markOccludedPoints() 中计算，并将其在 cloudNeighborPicked 中标记为 1
+                    // ② 该点曲率大于阈值。阈值为0.1 。
+                    // ③ 该点不为地面点。
                     if (cloudNeighborPicked[ind] == 0 &&
                         cloudCurvature[ind] > edgeThreshold &&
                         segInfo.segmentedCloudGroundFlag[ind] == false) {
                     
+                        //
                         largestPickedNum++;
+
+                        // 优先收集 2 个 优质角点                            评论：优质角点 是 次优角点 的子集
                         if (largestPickedNum <= 2) {
-                            cloudLabel[ind] = 2;
+                            cloudLabel[ind] = 2;  // 标记该点为 优质角点（用2表示）
                             cornerPointsSharp->push_back(segmentedCloud->points[ind]);
                             cornerPointsLessSharp->push_back(segmentedCloud->points[ind]);
-                        } else if (largestPickedNum <= 20) {
-                            cloudLabel[ind] = 1;
+                        }
+                        // 其次收集 20 个 次优角点
+                        else if (largestPickedNum <= 20) {
+                            cloudLabel[ind] = 1;  // 标记该点为 次优角点（用1表示）
                             cornerPointsLessSharp->push_back(segmentedCloud->points[ind]);
                         } else {
+                            // 优质角点、次优角点 都收集够了，就break结束循环
                             break;
                         }
 
+                        /* 下面这块代码写在这里，说明是 优质角点、次优角点 都要执行的。 */
+
+                        // 将该点在 cloudNeighborPicked 中标记为1。这么看来，cloudNeighborPicked 为 1 有两个含义：① 为遮挡点 ② 已挑选为特征点的点（往下看，还包括其左右各5个点）
                         cloudNeighborPicked[ind] = 1;
+
+
+                        // 这两个for循环在做的事情：最大值抑制
+                        // 将该点右侧5个点，在 cloudNeighborPicked 中标记为1
+                        // 有一种特殊情况不标记：列号变化>10。个人认为，只有越界到下一条线的点，才会导致列号由1800突变为0。但是，已经在segInfo.startRingIndex赋值的时候考虑到这一点了，这里还有必要判断吗？
                         for (int l = 1; l <= 5; l++) {
                             int columnDiff = std::abs(int(segInfo.segmentedCloudColInd[ind + l] - segInfo.segmentedCloudColInd[ind + l - 1]));
                             if (columnDiff > 10)
                                 break;
                             cloudNeighborPicked[ind + l] = 1;
                         }
+                        // 对左侧5个点做类似的操作
                         for (int l = -1; l >= -5; l--) {
                             int columnDiff = std::abs(int(segInfo.segmentedCloudColInd[ind + l] - segInfo.segmentedCloudColInd[ind + l + 1]));
                             if (columnDiff > 10)
@@ -721,21 +829,27 @@ public:
                 }
 
                 int smallestPickedNum = 0;
+                // 从下标sp到下标ep，对cloudSmoothness遍历，即按照曲率从小到大遍历
+                // 显然，这个过程是用来选择面点 （实际上，是用来选择 优质面点）                                  评论：因为和选择角点的代码类似，这里只对不同的地方作注释
                 for (int k = sp; k <= ep; k++) {
                     int ind = cloudSmoothness[k].ind;
                     if (cloudNeighborPicked[ind] == 0 &&
-                        cloudCurvature[ind] < surfThreshold &&
-                        segInfo.segmentedCloudGroundFlag[ind] == true) {
+                        cloudCurvature[ind] < surfThreshold &&  // 面点曲率阈值：0.1
+                        segInfo.segmentedCloudGroundFlag[ind] == true) {  //                            评论：优质面点 只从 地面点 中选取
 
-                        cloudLabel[ind] = -1;
-                        surfPointsFlat->push_back(segmentedCloud->points[ind]);
+                        cloudLabel[ind] = -1;  // 在 cloudLabel 中，用 -1 表示 优质面点
+                        surfPointsFlat->push_back(segmentedCloud->points[ind]);  // 将该点加入到 优质面点
 
                         smallestPickedNum++;
+                        // 优质面点的数量为4
                         if (smallestPickedNum >= 4) {
                             break;
                         }
 
+                        // 将该点在 cloudNeighborPicked 中标记为 1
                         cloudNeighborPicked[ind] = 1;
+
+                        // 将该点的左右各5个点，在 cloudNeighborPicked 中标记为 1，即 最大值抑制
                         for (int l = 1; l <= 5; l++) {
 
                             int columnDiff = std::abs(int(segInfo.segmentedCloudColInd[ind + l] - segInfo.segmentedCloudColInd[ind + l - 1]));
@@ -755,13 +869,23 @@ public:
                     }
                 }
 
+                // 从下标sp到下标ep，对cloudSmoothness遍历，即按照曲率从小到大遍历
                 for (int k = sp; k <= ep; k++) {
+                    // 如果该点是 优质面点(-1)，或非特征点
                     if (cloudLabel[k] <= 0) {
-                        surfPointsLessFlatScan->push_back(segmentedCloud->points[k]);
+                        // 将该点加入到 次优面点
+                        // 这样看来，次优面点会非常多。次优角点(20个) + 次优面点(大量) = 所有点 。
+                        surfPointsLessFlatScan->push_back(segmentedCloud->points[k]);  // 注意，这个成员变量最后是 Scan 结尾的，因为只是临时存放，待会要进行 下采样
                     }
                 }
             }
 
+
+            // 使用 体素滤波器，对当前环的 次优面点 下采样
+            // 至此，搞清楚了 surfPointsLessFlatScan 和 surfPointsLessFlatScanDS 这两个 成员变量 的作者：
+            //      前者，用于存放一个环中的 次优面点
+            //      后者，用于存放前者下采样的结果
+            //      其实吧，这两个变量 都能用 局部变量 替代，作者搞成 成员变量，估计是为了 高效
             surfPointsLessFlatScanDS->clear();
             downSizeFilter.setInputCloud(surfPointsLessFlatScan);
             downSizeFilter.filter(*surfPointsLessFlatScanDS);
@@ -770,10 +894,15 @@ public:
         }
     }
 
+    /*
+    发布四种特征点：优质角点、次优角点、优质面点、次优面点
+    */
     void publishCloud()
     {
         sensor_msgs::PointCloud2 laserCloudOutMsg;
 
+        // 如果有节点订阅了 /laser_cloud_sharp 话题
+        // 将成员变量 cornerPointsSharp(优质角点) 发布到该话题
 	    if (pubCornerPointsSharp.getNumSubscribers() != 0){
 	        pcl::toROSMsg(*cornerPointsSharp, laserCloudOutMsg);
 	        laserCloudOutMsg.header.stamp = cloudHeader.stamp;
@@ -781,6 +910,8 @@ public:
 	        pubCornerPointsSharp.publish(laserCloudOutMsg);
 	    }
 
+        // 如果有节点订阅了 /laser_cloud_less_sharp 话题
+        // 将成员变量 cornerPointsLessSharp(次优角点) 发布到该话题
 	    if (pubCornerPointsLessSharp.getNumSubscribers() != 0){
 	        pcl::toROSMsg(*cornerPointsLessSharp, laserCloudOutMsg);
 	        laserCloudOutMsg.header.stamp = cloudHeader.stamp;
@@ -788,6 +919,8 @@ public:
 	        pubCornerPointsLessSharp.publish(laserCloudOutMsg);
 	    }
 
+        // 如果有节点订阅了 /laser_cloud_flat 话题
+        // 将成员变量 surfPointsFlat(优质面点) 发布到该话题
 	    if (pubSurfPointsFlat.getNumSubscribers() != 0){
 	        pcl::toROSMsg(*surfPointsFlat, laserCloudOutMsg);
 	        laserCloudOutMsg.header.stamp = cloudHeader.stamp;
@@ -795,6 +928,8 @@ public:
 	        pubSurfPointsFlat.publish(laserCloudOutMsg);
 	    }
 
+        // 如果有节点订阅了 /laser_cloud_less_flat 话题
+        // 将成员变量 surfPointsLessFlat(次优面点) 发布到该话题
 	    if (pubSurfPointsLessFlat.getNumSubscribers() != 0){
 	        pcl::toROSMsg(*surfPointsLessFlat, laserCloudOutMsg);
 	        laserCloudOutMsg.header.stamp = cloudHeader.stamp;
@@ -803,50 +938,14 @@ public:
 	    }
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    /*
+    作用：
+    将点 pi 根据 transformCur 进行平移和旋转，变为 po。
+    【 transfromCur 的含义尚不知道 】
+    */
     void TransformToStart(PointType const * const pi, PointType * const po)
     {
-        float s = 1; //10 * (pi->intensity - int(pi->intensity));
+        float s = 1;  //10 * (pi->intensity - int(pi->intensity));
 
         float rx = s * transformCur[0];
         float ry = s * transformCur[1];
@@ -855,20 +954,27 @@ public:
         float ty = s * transformCur[4];
         float tz = s * transformCur[5];
 
+        // 先平移，再绕着 z 轴旋转
         float x1 = cos(rz) * (pi->x - tx) + sin(rz) * (pi->y - ty);
         float y1 = -sin(rz) * (pi->x - tx) + cos(rz) * (pi->y - ty);
         float z1 = (pi->z - tz);
 
+        // 绕着 x 轴旋转
         float x2 = x1;
         float y2 = cos(rx) * y1 + sin(rx) * z1;
         float z2 = -sin(rx) * y1 + cos(rx) * z1;
 
+        // 绕着 y 轴旋转
         po->x = cos(ry) * x2 - sin(ry) * z2;
         po->y = y2;
         po->z = sin(ry) * x2 + cos(ry) * z2;
         po->intensity = pi->intensity;
     }
 
+    /*
+    作用：
+
+    */
     void TransformToEnd(PointType const * const pi, PointType * const po)
     {
         float s = 10 * (pi->intensity - int(pi->intensity));
@@ -1139,22 +1245,42 @@ public:
         }
     }
 
-    void findCorrespondingSurfFeatures(int iterCount){
+    /*
+    作用：
 
+    */
+    void findCorrespondingSurfFeatures(int iterCount){
+        // 优质面点的数量
         int surfPointsFlatNum = surfPointsFlat->points.size();
 
+        // 遍历所有优质面点
         for (int i = 0; i < surfPointsFlatNum; i++) {
-
+            // 对当前优质面点做坐标变换，变换到上一帧点云的坐标系下
+            // 变换后的点保存至 成员变量 pointSel 中
             TransformToStart(&surfPointsFlat->points[i], &pointSel);
 
+            // 为什么这里每5次迭代才执行一次？
+            // 节省计算时间，每5次优化，重新找一下每个优质面点对应的平面
             if (iterCount % 5 == 0) {
-
+                // 从上一帧的次优面点中，搜索 pointSel 的最近邻
+                // 搜索结果的下标保存至 成员变量 pointSearchInd 中，距离保存至 成员变量 pointSearchSqDis 中                 评论：这两个变量可以用局部变量
                 kdtreeSurfLast->nearestKSearch(pointSel, 1, pointSearchInd, pointSearchSqDis);
                 int closestPointInd = -1, minPointInd2 = -1, minPointInd3 = -1;
 
-                if (pointSearchSqDis[0] < nearestFeatureSearchSqDist) {
+                // 如果 pointSel 与 最近邻 的距离小于 阈值
+                if (pointSearchSqDis[0] < nearestFeatureSearchSqDist) {  // 阈值：25
                     closestPointInd = pointSearchInd[0];
+
+                    // laserCloudSurfLast 的 intensity 分量保存的是：(深度图的)行号 + （ 列号 / 1万 ），强转成 int ，就变成了行号（线号）
                     int closestPointScan = int(laserCloudSurfLast->points[closestPointInd].intensity);
+
+                    /*
+                    下面这个 for 循环做的事情：
+                    从 最近邻点（closestPoint）右侧的同环 次优面点 中，找到和 最近邻点 最近的点，将其下标保存到 minPointInd2 局部变量中；
+                    从 最近邻点（closestPoint）更高环（最多比它高2环）里的 次优面点 中，找到和 最近邻点 最近的点，将其下标保存到 minPointInd3 局部变量中。
+
+                    至此，上方声明的 minPointInd2、minPointInd3 局部变量，以及下方声明的 minPointSqDis2、minPointSqDis3 的作用变得清晰。
+                    */
 
                     float pointSqDis, minPointSqDis2 = nearestFeatureSearchSqDist, minPointSqDis3 = nearestFeatureSearchSqDist;
                     for (int j = closestPointInd + 1; j < surfPointsFlatNum; j++) {
@@ -1169,18 +1295,29 @@ public:
                                      (laserCloudSurfLast->points[j].z - pointSel.z) * 
                                      (laserCloudSurfLast->points[j].z - pointSel.z);
 
+                        // 如果 points[j] 的行号 <= 最近邻点 的行号
+                        // 个人认为，“<” 不可能成立，最多“=”成立
                         if (int(laserCloudSurfLast->points[j].intensity) <= closestPointScan) {
                             if (pointSqDis < minPointSqDis2) {
                               minPointSqDis2 = pointSqDis;
                               minPointInd2 = j;
                             }
-                        } else {
+                        }
+                        // 如果 points[j] 的行号 > 最近邻点 的行号
+                        else {
                             if (pointSqDis < minPointSqDis3) {
                                 minPointSqDis3 = pointSqDis;
                                 minPointInd3 = j;
                             }
                         }
                     }
+
+                    /*
+                    下面这个 for 循环做的事情：
+                    和上方的 for 循环对称，这次是在 同环的左侧 找 minPointInd2；不同环的更低环中找 minPointInd3 。
+                    如果比上方 for 循环中找到的点更近，则替代。
+
+                    */
                     for (int j = closestPointInd - 1; j >= 0; j--) {
                         if (int(laserCloudSurfLast->points[j].intensity) < closestPointScan - 2.5) {
                             break;
@@ -1207,16 +1344,23 @@ public:
                     }
                 }
 
+                // 三点确定一个平面，这个平面是用来计算 第i个优质面点 到平面的距离用的
                 pointSearchSurfInd1[i] = closestPointInd;
                 pointSearchSurfInd2[i] = minPointInd2;
                 pointSearchSurfInd3[i] = minPointInd3;
             }
 
+            // 如果找到了 当前优质面点 对应的 平面
             if (pointSearchSurfInd2[i] >= 0 && pointSearchSurfInd3[i] >= 0) {
-
+                // tripod1~3 就是确定该平面的三个点                                  评论：tripod 是“三脚架”的意思
                 tripod1 = laserCloudSurfLast->points[pointSearchSurfInd1[i]];
                 tripod2 = laserCloudSurfLast->points[pointSearchSurfInd2[i]];
                 tripod3 = laserCloudSurfLast->points[pointSearchSurfInd3[i]];
+
+                /*
+                个人猜测，作者在用平面三个点，计算平面的系数。
+                平面方程：Ax+By+Cz+D=0，正好有 A、B、C、D 四个参数，可以存放到 coeff 变量的 x、y、z、intensity 中。
+                */
 
                 float pa = (tripod2.y - tripod1.y) * (tripod3.z - tripod1.z) 
                          - (tripod3.y - tripod1.y) * (tripod2.z - tripod1.z);
@@ -1247,6 +1391,8 @@ public:
                     coeff.z = s * pc;
                     coeff.intensity = s * pd2;
 
+                    // 将 当前帧的该优质面点 存入 laserCloudOri 中
+                    // 将 其对应的平面方程的系数，存入 coeffSel 中
                     laserCloudOri->push_back(surfPointsFlat->points[i]);
                     coeffSel->push_back(coeff);
                 }
@@ -1255,7 +1401,8 @@ public:
     }
 
     bool calculateTransformationSurf(int iterCount){
-
+        // 找到对应平面的 优质面点 的数量                          评论：作者用 pointSel 表示找到对应平面的优质面点，sel可能是select的缩写，表示“精选的”。
+        //                                                          所以，我们可以将其称为 “精选面点”
         int pointSelNum = laserCloudOri->points.size();
 
         cv::Mat matA(pointSelNum, 3, CV_32F, cv::Scalar::all(0));
@@ -1265,7 +1412,7 @@ public:
         cv::Mat matAtB(3, 1, CV_32F, cv::Scalar::all(0));
         cv::Mat matX(3, 1, CV_32F, cv::Scalar::all(0));
 
-        float srx = sin(transformCur[0]);
+        float srx = sin(transformCur[0]);  // sin(rotation_x)
         float crx = cos(transformCur[0]);
         float sry = sin(transformCur[1]);
         float cry = cos(transformCur[1]);
@@ -1285,6 +1432,7 @@ public:
         float c1 = -b6; float c2 = b5; float c3 = tx*b6 - ty*b5; float c4 = -crx*crz; float c5 = crx*srz; float c6 = ty*c5 + tx*-c4;
         float c7 = b2; float c8 = -b1; float c9 = tx*-b2 - ty*-b1;
 
+        // 遍历所有 精选面点
         for (int i = 0; i < pointSelNum; i++) {
 
             pointOri = laserCloudOri->points[i];
@@ -1589,37 +1737,61 @@ public:
         return true;
     }
 
+    /*
+    作用：
+    ① 初始化 laserCloudCornerLast 成员变量。
+    ② 初始化 laserCloudSurfLast 成员变量。
+    ③ 初始化 kdtreeCornerLast 成员变量。
+    ④ 初始化 kdtreeCornerLast 成员变量。
+    ⑤ 初始化 laserCloudCornerLastNum 成员变量。
+    ⑥ 初始化 laserCloudSurfLastNum 成员变量。
+    ⑦ 发布 /laser_cloud_corner_last 话题消息。
+    ⑧ 发布 /laser_cloud_surf_last 话题消息。
+    */
     void checkSystemInitialization(){
-
+        // 交换 cornerPointsLessSharp 和 laserCloudCornerLast 两个点云
+        // 即，将 当前帧的 次优角点，保存到成员变量，作为 上一帧的 次优角点
         pcl::PointCloud<PointType>::Ptr laserCloudTemp = cornerPointsLessSharp;
         cornerPointsLessSharp = laserCloudCornerLast;
         laserCloudCornerLast = laserCloudTemp;
 
+        // 交换 surfPointsLessFlat 和 laserCloudSurfLast 两个点云
+        // 即，将 当前帧的 次优面点，保存到成员变量，作为 上一帧的 次优面点
         laserCloudTemp = surfPointsLessFlat;
         surfPointsLessFlat = laserCloudSurfLast;
         laserCloudSurfLast = laserCloudTemp;
 
+        // 使用 laserCloudCornerLast 点云的点，建立 kdtreeCornerLast KD-Tree
+        // 即，对 上一帧的 次优角点，建立KD-Tree
         kdtreeCornerLast->setInputCloud(laserCloudCornerLast);
+        // 使用 laserCloudSurfLast 点云的点，建立 kdtreeSurfLast KD-Tree
+        // 即，对 上一帧的 面点，建立KD-Tree
         kdtreeSurfLast->setInputCloud(laserCloudSurfLast);
 
+        // 将 上一帧的 次优角点 的数量，保存到 laserCloudCornerLastNum 成员变量中
         laserCloudCornerLastNum = laserCloudCornerLast->points.size();
+        // 将 上一帧的 次优面点 的数量，保存到 laserCloudSurfLastNum 成员变量中
         laserCloudSurfLastNum = laserCloudSurfLast->points.size();
 
+        // 将 laserCloudCornerLast(上一帧的次优角点) 发布到 /laser_cloud_corner_last 话题
         sensor_msgs::PointCloud2 laserCloudCornerLast2;
         pcl::toROSMsg(*laserCloudCornerLast, laserCloudCornerLast2);
         laserCloudCornerLast2.header.stamp = cloudHeader.stamp;
         laserCloudCornerLast2.header.frame_id = "/camera";
         pubLaserCloudCornerLast.publish(laserCloudCornerLast2);
 
+        // 将 laserCloudCornerLast(上一帧的次优面点) 发布到 /laser_cloud_surf_last 话题
         sensor_msgs::PointCloud2 laserCloudSurfLast2;
         pcl::toROSMsg(*laserCloudSurfLast, laserCloudSurfLast2);
         laserCloudSurfLast2.header.stamp = cloudHeader.stamp;
         laserCloudSurfLast2.header.frame_id = "/camera";
         pubLaserCloudSurfLast.publish(laserCloudSurfLast2);
 
+        // 【这个和IMU有关，暂时不管】
         transformSum[0] += imuPitchStart;
         transformSum[2] += imuRollStart;
 
+        // 将 systemInitedLM 成员变量置为 true，表示 LM 优化相关变量初始化完成
         systemInitedLM = true;
     }
 
@@ -1651,18 +1823,25 @@ public:
     }
 
     void updateTransformation(){
-
+        // 如果上一帧的 次优角点数量<10 或 次优面点数量<100，直接返回
         if (laserCloudCornerLastNum < 10 || laserCloudSurfLastNum < 100)
             return;
 
+        // 为什么要迭代25次？
         for (int iterCount1 = 0; iterCount1 < 25; iterCount1++) {
+            // 这两个点云成员变量的作用：
+            // ① laserCloudOri 存放 找到了 对应平面的 优质面点
+            // ② coeffSel 存放 平面方程 的系数
             laserCloudOri->clear();
             coeffSel->clear();
 
+            // 寻找 优质面点 对应的 上一帧中的平面
             findCorrespondingSurfFeatures(iterCount1);
 
+            // 如果 找到对应平面的 优质面点 的数量 < 10，xxxxx
             if (laserCloudOri->points.size() < 10)
                 continue;
+
             if (calculateTransformationSurf(iterCount1) == false)
                 break;
         }
@@ -1801,13 +1980,19 @@ public:
         }
     }
 
+    /*
+    调用频率：每隔50ms调用一次
+    */
     void runFeatureAssociation()
     {
 
+        // 如果已收到新的 分割点云 分割点云信息 离群点云
+        // 并且它们的时间戳只差在 5ms 以内                                        评论：这里好像有问题，因为这些时间戳都是用 .toSec() 获取的，可能只能精确到秒
         if (newSegmentedCloud && newSegmentedCloudInfo && newOutlierCloud &&
             std::abs(timeNewSegmentedCloudInfo - timeNewSegmentedCloud) < 0.05 &&
             std::abs(timeNewOutlierCloud - timeNewSegmentedCloud) < 0.05){
 
+            // 重置收到标记
             newSegmentedCloud = false;
             newSegmentedCloudInfo = false;
             newOutlierCloud = false;
@@ -1815,22 +2000,28 @@ public:
             return;
         }
         /**
-        	1. Feature Extraction
+            1. Feature Extraction 特征提取
         */
+        // 纠正扭曲
         adjustDistortion();
 
+        // 计算曲率
         calculateSmoothness();
 
+        // 标记遮挡的点
         markOccludedPoints();
 
+        // 提取特征点
         extractFeatures();
 
+        // 发布点云
         publishCloud(); // cloud for visualization
 	
         /**
-		2. Feature Association
+        2. Feature Association 特征关联
         */
         if (!systemInitedLM) {
+            // 初始化 “上一帧” 相关成员变量
             checkSystemInitialization();
             return;
         }
